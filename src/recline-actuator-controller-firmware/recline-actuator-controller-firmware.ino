@@ -13,136 +13,159 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_MCP23X17.h>
-
 /**
- * RP2040 Motor and Solenoid Controller Firmware with Limit Switches and RS485 Datagram Handling
+ * RP2040 Firmware: Motor & Solenoid Controller with:
+ *   - Limit Switch Endstop Handling
+ *   - Motor Current Sensing & Threshold Checking
+ *   - RS485 Datagram Handling (Imported from Other Firmware)
+ *   - Solenoid & Air Compressor Control via MCP23S17
  *
- * This firmware:
- *  - Configures local RP2040 pins for motor control (direction, enable, and PWM).
- *  - Sets up the MCP23S17 IO expander for limit switch inputs, solenoid/air-compressor MOSFET outputs, and RS485 LEDs.
- *  - Provides functions to drive motors to endstops (limit switches).
- *  - Receives RS485 datagrams (via Serial1) that control motors and solenoids (start, stop, direction).
- *  - Sends RS485 datagrams, if needed, to other devices.
+ * Detailed & Verbose Comments Included
  *
- * (c) 2023. Provided under GPL v3 or later.
+ * (c) 2023. Licensed under GPL v3 or later.
  */
 
-#include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_MCP23X17.h>
-#include "hardware/uart.h"
+#include <Wire.h>                  // For I2C (if needed)
+#include <SPI.h>                   // For SPI communication
+#include <Adafruit_MCP23X17.h>     // Adafruit library for MCP23S17 IO Expander
+#include "hardware/uart.h"         // RP2040 hardware UART (for RS485 use)
 
-// -----------------------------------------------------------------------------
-// Instantiate the MCP23S17 for SPI communication
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Instantiate MCP23S17 for SPI
+// ---------------------------------------------------------------------------
 Adafruit_MCP23X17 mcp;  
 
-// -----------------------------------------------------------------------------
-// Local RP2040 Pin Assignments for Motor Control (H-Bridge)
-// -----------------------------------------------------------------------------
-#define M1PWM  13  // PWM signal for Motor 1
-#define M2PWM  10  // PWM signal for Motor 2
-#define M3PWM  6   // PWM signal for Motor 3
-#define M4PWM  1   // PWM signal for Motor 4
+// ---------------------------------------------------------------------------
+// RP2040 Pin Assignments for Motor (H-Bridge) Control
+// ---------------------------------------------------------------------------
+// Each motor has: PWM pin, two direction pins (INA/INB), and an enable pin (ENA).
+#define M1PWM  13  // PWM output for Motor 1
+#define M2PWM  10  // PWM output for Motor 2
+#define M3PWM   6  // PWM output for Motor 3
+#define M4PWM   1  // PWM output for Motor 4
 
-#define M1INA  15  // Motor 1 direction control (IN A)
-#define M1INB  12  // Motor 1 direction control (IN B)
-#define M2INA  11  // Motor 2 direction control (IN A)
-#define M2INB  8   // Motor 2 direction control (IN B)
-#define M3INA  7   // Motor 3 direction control (IN A)
-#define M3INB  4   // Motor 3 direction control (IN B)
-#define M4INA  3   // Motor 4 direction control (IN A)
-#define M4INB  0   // Motor 4 direction control (IN B)
+#define M1INA  15  // Motor 1 direction: IN A
+#define M1INB  12  // Motor 1 direction: IN B
+#define M2INA  11  // Motor 2 direction: IN A
+#define M2INB   8  // Motor 2 direction: IN B
+#define M3INA   7  // Motor 3 direction: IN A
+#define M3INB   4  // Motor 3 direction: IN B
+#define M4INA   3  // Motor 4 direction: IN A
+#define M4INB   0  // Motor 4 direction: IN B
 
 #define M1ENA  14  // Enable pin for Motor 1
-#define M2ENA  9   // Enable pin for Motor 2
-#define M3ENA  5   // Enable pin for Motor 3
-#define M4ENA  2   // Enable pin for Motor 4
+#define M2ENA   9  // Enable pin for Motor 2
+#define M3ENA   5  // Enable pin for Motor 3
+#define M4ENA   2  // Enable pin for Motor 4
 
-// -----------------------------------------------------------------------------
-// MCP23S17 Bank A - Limit Switch Pin Assignments (Inputs)
-// -----------------------------------------------------------------------------
-#define LIMIT_SWITCH_MIN_1  0  // GPA0 (Motor 1 min limit)
-#define LIMIT_SWITCH_MIN_2  1  // GPA1 (Motor 2 min limit)
-#define LIMIT_SWITCH_MIN_3  2  // GPA2 (Motor 3 min limit)
-#define LIMIT_SWITCH_MIN_4  3  // GPA3 (Motor 4 min limit)
-#define LIMIT_SWITCH_MAX_1  4  // GPA4 (Motor 1 max limit)
-#define LIMIT_SWITCH_MAX_2  5  // GPA5 (Motor 2 max limit)
-#define LIMIT_SWITCH_MAX_3  6  // GPA6 (Motor 3 max limit)
-#define LIMIT_SWITCH_MAX_4  7  // GPA7 (Motor 4 max limit)
+// ---------------------------------------------------------------------------
+// MCP23S17 Bank A: Limit Switch Pins (Inputs, Active-Low)
+// ---------------------------------------------------------------------------
+// The limit switches are connected to the IO expander's Bank A pins (GPA0..GPA7).
+// Each motor has a min and a max limit switch.
+#define LIMIT_SWITCH_MIN_1  0  // GPA0
+#define LIMIT_SWITCH_MIN_2  1  // GPA1
+#define LIMIT_SWITCH_MIN_3  2  // GPA2
+#define LIMIT_SWITCH_MIN_4  3  // GPA3
+#define LIMIT_SWITCH_MAX_1  4  // GPA4
+#define LIMIT_SWITCH_MAX_2  5  // GPA5
+#define LIMIT_SWITCH_MAX_3  6  // GPA6
+#define LIMIT_SWITCH_MAX_4  7  // GPA7
 
-// -----------------------------------------------------------------------------
-// MCP23S17 Bank B - Solenoid/Air, Power Good, RS485 LEDs
-// -----------------------------------------------------------------------------
-#define AIR_COMPRESSOR_MOSFET  8   // GPB0 (air compressor MOSFET)
-#define SOLENOID_3_MOSFET      9   // GPB1 (solenoid #3)
-#define SOLENOID_2_MOSFET      10  // GPB2 (solenoid #2)
-#define SOLENOID_1_MOSFET      11  // GPB3 (solenoid #1)
-#define SOLENOID_0_MOSFET      12  // GPB4 (solenoid #0)
-#define POWER_GOOD_PIN         13  // GPB5 (3.3V DCDC regulator power-good, input)
-#define RS485_TX_LED           14  // GPB6 (RS485 TX LED)
-#define RS485_RX_LED           15  // GPB7 (RS485 RX LED)
+// ---------------------------------------------------------------------------
+// MCP23S17 Bank B: Solenoids, Air Compressor, Power Good, RS485 LEDs
+// ---------------------------------------------------------------------------
+// Each solenoid and the air compressor MOSFET are on outputs, plus pins for RS485 LEDs and the power good signal.
+#define AIR_COMPRESSOR_MOSFET   8   // GPB0
+#define SOLENOID_3_MOSFET       9   // GPB1
+#define SOLENOID_2_MOSFET      10   // GPB2
+#define SOLENOID_1_MOSFET      11   // GPB3
+#define SOLENOID_0_MOSFET      12   // GPB4
+#define POWER_GOOD_PIN         13   // GPB5 (Input, to read power good status)
+#define RS485_TX_LED           14   // GPB6
+#define RS485_RX_LED           15   // GPB7
 
-// -----------------------------------------------------------------------------
-// RS485 Datagram Definitions (matching previous firmware)
-// -----------------------------------------------------------------------------
-#define RS485_HEADER   0x7E   // Start byte
-#define RS485_END_BYTE 0xFF   // End byte
+// ---------------------------------------------------------------------------
+// Current Sensing Inputs (RP2040 Analog Pins)
+// ---------------------------------------------------------------------------
+// Each motor has a current sense output that goes to an ADC pin on the RP2040.
+#define CURRENT_SENSOR_1  26  // Motor 1 current sense -> GPIO26
+#define CURRENT_SENSOR_2  27  // Motor 2 current sense -> GPIO27
+#define CURRENT_SENSOR_3  28  // Motor 3 current sense -> GPIO28
+#define CURRENT_SENSOR_4  29  // Motor 4 current sense -> GPIO29
 
-// Command Types
-#define CMD_START     0x01
-#define CMD_STOP      0x02
-#define CMD_MOTOR     0x03
-#define CMD_SOLENOID  0x04
+// Current thresholds in amps (example values). If a motor’s current is outside
+// these bounds, we stop the motor for safety / protection.
+#define CURRENT_THRESHOLD_MIN_1  0.5f
+#define CURRENT_THRESHOLD_MAX_1  3.0f
+#define CURRENT_THRESHOLD_MIN_2  0.5f
+#define CURRENT_THRESHOLD_MAX_2  3.0f
+#define CURRENT_THRESHOLD_MIN_3  0.5f
+#define CURRENT_THRESHOLD_MAX_3  3.0f
+#define CURRENT_THRESHOLD_MIN_4  0.5f
+#define CURRENT_THRESHOLD_MAX_4  3.0f
 
-// -----------------------------------------------------------------------------
-// RS485 Payload Structures
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// RS485 Datagram Format (Matching the Other Firmware)
+// ---------------------------------------------------------------------------
+// These define how we parse incoming commands and structure outgoing ones.
+#define RS485_HEADER   0x7E
+#define RS485_END_BYTE 0xFF
+
+// RS485 Command Types
+#define CMD_START      0x01
+#define CMD_STOP       0x02
+#define CMD_MOTOR      0x03
+#define CMD_SOLENOID   0x04
+
+// Payload structures for motor or solenoid commands
 struct MotorControlPayload {
-    uint8_t motorID;    // Motor ID (0..3)
+    uint8_t motorID;    // 0..3 for four motors
     uint8_t direction;  // 0=Stop, 1=Forward, 2=Reverse
 };
 
 struct SolenoidControlPayload {
-    uint8_t solenoidID; // 0..4 (0..3 = solenoids, 4 = air compressor)
+    uint8_t solenoidID; // 0..4 => 0..3 for solenoids, 4 for air compressor
     uint8_t state;      // 0=Off, 1=On
 };
 
-// Union for motor or solenoid payload
+// Union to store either motor or solenoid payload
 union PayloadData {
-    MotorControlPayload motorControl;
-    SolenoidControlPayload solenoidControl;
+    MotorControlPayload       motorControl;
+    SolenoidControlPayload    solenoidControl;
 };
 
-// Full RS485 Datagram structure
+// RS485 Datagram structure
 struct RS485Datagram {
-    uint8_t startByte;    // e.g., 0x7E
-    uint8_t address;      // target device address
-    uint8_t command;      // e.g., CMD_MOTOR, CMD_SOLENOID
-    uint8_t dataLength;   // length of payload
-    PayloadData payload;  // motor or solenoid data
-    uint8_t checksum;     
-    uint8_t endByte;      // e.g., 0xFF
+    uint8_t  startByte;    // e.g., 0x7E
+    uint8_t  address;      // device address
+    uint8_t  command;      // e.g. CMD_MOTOR
+    uint8_t  dataLength;   // how many bytes in payload
+    PayloadData payload;   // either motor or solenoid data
+    uint8_t  checksum;     
+    uint8_t  endByte;      // e.g., 0xFF
 };
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Global Variables
-// -----------------------------------------------------------------------------
-String receivedCommand   = "";    // Buffer for incoming text from Serial1 (RS485)
-bool   systemInitialized = false; // Whether the system is "active" (motors/solenoids allowed)
+// ---------------------------------------------------------------------------
+String receivedCommand   = "";    // Buffer for text from RS485 (Serial1)
+bool   systemInitialized = false; // Indicates if the system is active
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Function Declarations
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 void setupMCP23S17();
+void setupCurrentSensors();
+void monitorCurrentDraw();
+
 void controlMOSFET(int solenoidID, bool state);
 void controlMotor(int motorID, uint8_t direction, uint8_t pwmValue);
 void stopMotor(int motorID);
+
 bool readLimitSwitch(int motor, bool isMaxLimit);
 void driveMotorToEndstop(int motor, int direction);
+
 RS485Datagram parseRS485Datagram(const String &datagram);
 void handleRS485Command();
 void sendRS485Datagram(RS485Datagram& datagram);
@@ -151,13 +174,13 @@ void sendRS485Datagram(RS485Datagram& datagram);
 // SETUP (Arduino entry point)
 // =============================================================================
 void setup() {
-  // Start USB serial for debugging/logging
+  // Start USB serial for debugging
   Serial.begin(115200);
-  Serial.println("RP2040 Motor Controller w/ Endstop + RS485 + Solenoids, Enhanced Setup");
+  Serial.println("RP2040 Motor/Solenoid Controller w/ Limit Switch, Current Sense, RS485");
 
-  // --------------------------------------------------
-  // Configure Local (RP2040) Pins for Motor Control
-  // --------------------------------------------------
+  // -------------------------
+  // Configure Local RP2040 Pins for Motors
+  // -------------------------
   pinMode(M1INA, OUTPUT);  digitalWrite(M1INA, LOW);
   pinMode(M1INB, OUTPUT);  digitalWrite(M1INB, LOW);
   pinMode(M1ENA, OUTPUT);  digitalWrite(M1ENA, LOW);
@@ -178,19 +201,17 @@ void setup() {
   pinMode(M4ENA, OUTPUT);  digitalWrite(M4ENA, LOW);
   pinMode(M4PWM, OUTPUT);  analogWrite(M4PWM, 0);
 
-  // --------------------------------------------------
-  // Initialize MCP23S17 (IO Expander) for limit switches, solenoids, LEDs
-  // --------------------------------------------------
+  // -------------------------
+  // Initialize MCP23S17 (SPI IO Expander) for limit switches + solenoids
+  // -------------------------
   setupMCP23S17();
 
-  // --------------------------------------------------
-  // (Optionally) Setup RS485 TX/RX pins, direction pins, etc.
-  // If your board has them pre-mapped, you may not need to do anything extra.
-  // e.g.: pinMode(uartTxPin, OUTPUT); pinMode(uartRxPin, INPUT);
-  // ...
-  // --------------------------------------------------
+  // -------------------------
+  // Initialize Current Sensors (Analog inputs on RP2040)
+  // -------------------------
+  setupCurrentSensors();
 
-  // By default, system is off until we get a "START" command
+  // System remains off until a "START" command is received over RS485
   systemInitialized = false;
 }
 
@@ -198,36 +219,37 @@ void setup() {
 // LOOP (Arduino entry point)
 // =============================================================================
 void loop() {
-  // Continuously handle any incoming RS485 commands
+  // Check if there's an incoming RS485 command and process it
   handleRS485Command();
 
-  // If system is not initialized, everything remains off
+  // If system is not initialized, motors and solenoids stay off
   if (!systemInitialized) {
     return;
   }
 
-  // If desired, you can add any "automatic" motor sequences here
-  // e.g. driveMotorToEndstop(0, 1); ...
+  // If the system is active, monitor motor currents for safety
+  monitorCurrentDraw();
+
+  // You can add auto actions here, e.g. driving motors to endstops, etc.
+  // Example:
+  // driveMotorToEndstop(0, 1); ...
 }
 
 // =============================================================================
-// SETUP MCP23S17 - IO EXPANDER
+// setupMCP23S17 - Configure the IO Expander
 // =============================================================================
 void setupMCP23S17() {
-  // Initialize MCP23S17 over SPI, address 0x20
   if (!mcp.begin_SPI(0x20, &SPI)) {
     Serial.println("Error: MCP23S17 not found at address 0x20 via SPI");
-    while (true); // Halt
+    while (true);
   }
 
-  // Bank A (0..7) => limit switches (inputs, pull-up)
+  // Bank A: limit switches as inputs with pull-up
   for (uint8_t i = 0; i < 8; i++) {
     mcp.pinMode(i, INPUT_PULLUP);
   }
 
-  // Bank B => solenoids & air compressor (0..4, outputs),
-  //           power-good signal (5, input),
-  //           RS485 LEDs (6,7 outputs).
+  // Bank B: solenoids, air compressor (outputs), power good (input), RS485 LEDs (outputs)
   mcp.pinMode(AIR_COMPRESSOR_MOSFET, OUTPUT);
   mcp.pinMode(SOLENOID_3_MOSFET, OUTPUT);
   mcp.pinMode(SOLENOID_2_MOSFET, OUTPUT);
@@ -239,32 +261,93 @@ void setupMCP23S17() {
 
   mcp.pinMode(POWER_GOOD_PIN, INPUT);
 
-  Serial.println("MCP23S17 configured for limit switches, solenoids, & RS485 LEDs.");
+  Serial.println("MCP23S17 configured for limit switches, solenoids, RS485 LEDs, etc.");
 }
 
 // =============================================================================
-// SOLENOID / AIR COMPRESSOR CONTROL
+// setupCurrentSensors - Configure RP2040 ADC for Motor Current Sense
+// =============================================================================
+void setupCurrentSensors() {
+  // If you're using Arduino-Pico core, you can do:
+  analogReadResolution(12); // 12-bit => 0..4095
+  // Make sure to pinMode them as input
+  pinMode(CURRENT_SENSOR_1, INPUT);
+  pinMode(CURRENT_SENSOR_2, INPUT);
+  pinMode(CURRENT_SENSOR_3, INPUT);
+  pinMode(CURRENT_SENSOR_4, INPUT);
+
+  Serial.println("Analog inputs (GPIO26..29) configured for current sensing.");
+}
+
+// =============================================================================
+// monitorCurrentDraw - Check if motors exceed current thresholds
+// =============================================================================
+void monitorCurrentDraw() {
+  // Example: read each ADC, convert to "amps" using a scale factor
+  // Here we do a simplified approach for demonstration
+
+  float raw1 = analogRead(CURRENT_SENSOR_1);
+  float raw2 = analogRead(CURRENT_SENSOR_2);
+  float raw3 = analogRead(CURRENT_SENSOR_3);
+  float raw4 = analogRead(CURRENT_SENSOR_4);
+
+  // Convert raw ADC => voltage => approximate current
+  // e.g. (ADC/4095)*3.3 => volts => amps if sense resistor is known
+  float current1 = (raw1 / 4095.0f) * 3.3f;
+  float current2 = (raw2 / 4095.0f) * 3.3f;
+  float current3 = (raw3 / 4095.0f) * 3.3f;
+  float current4 = (raw4 / 4095.0f) * 3.3f;
+
+  // Print for debugging
+  Serial.printf("Motor Currents => M1:%.2fA  M2:%.2fA  M3:%.2fA  M4:%.2fA\n",
+                current1, current2, current3, current4);
+
+  // Check Motor 1 thresholds
+  if (current1 < CURRENT_THRESHOLD_MIN_1 || current1 > CURRENT_THRESHOLD_MAX_1) {
+    Serial.println("WARNING: Motor 1 current out of range, stopping.");
+    stopMotor(0);
+  }
+  // Check Motor 2 thresholds
+  if (current2 < CURRENT_THRESHOLD_MIN_2 || current2 > CURRENT_THRESHOLD_MAX_2) {
+    Serial.println("WARNING: Motor 2 current out of range, stopping.");
+    stopMotor(1);
+  }
+  // Check Motor 3 thresholds
+  if (current3 < CURRENT_THRESHOLD_MIN_3 || current3 > CURRENT_THRESHOLD_MAX_3) {
+    Serial.println("WARNING: Motor 3 current out of range, stopping.");
+    stopMotor(2);
+  }
+  // Check Motor 4 thresholds
+  if (current4 < CURRENT_THRESHOLD_MIN_4 || current4 > CURRENT_THRESHOLD_MAX_4) {
+    Serial.println("WARNING: Motor 4 current out of range, stopping.");
+    stopMotor(3);
+  }
+}
+
+// =============================================================================
+// controlMOSFET - Turn a Solenoid or Air Compressor ON or OFF
 // =============================================================================
 void controlMOSFET(int solenoidID, bool state) {
   int pin;
   switch (solenoidID) {
-    case 0: pin = SOLENOID_0_MOSFET; break;
-    case 1: pin = SOLENOID_1_MOSFET; break;
-    case 2: pin = SOLENOID_2_MOSFET; break;
-    case 3: pin = SOLENOID_3_MOSFET; break;
-    case 4: pin = AIR_COMPRESSOR_MOSFET; break;
+    case 0: pin = SOLENOID_0_MOSFET;    break;
+    case 1: pin = SOLENOID_1_MOSFET;    break;
+    case 2: pin = SOLENOID_2_MOSFET;    break;
+    case 3: pin = SOLENOID_3_MOSFET;    break;
+    case 4: pin = AIR_COMPRESSOR_MOSFET;break;
     default:
-      Serial.println("Invalid Solenoid/Air ID");
+      Serial.println("Invalid Solenoid/Air ID!");
       return;
   }
-  // High => ON, Low => OFF
+  // Use the MCP23S17 to drive the corresponding pin
   mcp.digitalWrite(pin, state ? HIGH : LOW);
 }
 
 // =============================================================================
-// MOTOR CONTROL (H-BRIDGE)
+// controlMotor - Basic H-Bridge Control with Direction & PWM
 // =============================================================================
 void controlMotor(int motorID, uint8_t direction, uint8_t pwmValue) {
+  // direction => 0=Stop, 1=Forward, 2=Reverse
   int ina, inb, ena, pwmPin;
   switch (motorID) {
     case 0: ina=M1INA; inb=M1INB; ena=M1ENA; pwmPin=M1PWM; break;
@@ -276,21 +359,20 @@ void controlMotor(int motorID, uint8_t direction, uint8_t pwmValue) {
       return;
   }
 
-  // Direction: 0=Stop, 1=Forward, 2=Reverse
   if (direction == 0) {
-    // Stop
+    // Stop the motor
     digitalWrite(ena, LOW);
     digitalWrite(ina, LOW);
     digitalWrite(inb, LOW);
     analogWrite(pwmPin, 0);
-  }
+  } 
   else if (direction == 1) {
     // Forward
     digitalWrite(ena, HIGH);
     digitalWrite(ina, HIGH);
     digitalWrite(inb, LOW);
     analogWrite(pwmPin, pwmValue);
-  }
+  } 
   else if (direction == 2) {
     // Reverse
     digitalWrite(ena, HIGH);
@@ -301,14 +383,15 @@ void controlMotor(int motorID, uint8_t direction, uint8_t pwmValue) {
 }
 
 // =============================================================================
-// STOP MOTOR (CONVENIENCE)
+// stopMotor - Convenience function to instantly stop the motor
 // =============================================================================
 void stopMotor(int motorID) {
+  // Simply calls controlMotor(...) with direction=0, speed=0
   controlMotor(motorID, 0, 0);
 }
 
 // =============================================================================
-// LIMIT SWITCH READING
+// readLimitSwitch - Query the MCP23S17 for a min or max limit switch
 // =============================================================================
 bool readLimitSwitch(int motor, bool isMaxLimit) {
   int pin;
@@ -320,45 +403,49 @@ bool readLimitSwitch(int motor, bool isMaxLimit) {
     default:
       return false;
   }
-  // Active-low => LOW means switch triggered
+  // Active-low => LOW means triggered
   return (mcp.digitalRead(pin) == LOW);
 }
 
 // =============================================================================
-// DRIVE MOTOR UNTIL ENDSTOP
+// driveMotorToEndstop - Move motor until a limit switch triggers
 // =============================================================================
 void driveMotorToEndstop(int motor, int direction) {
-  // direction: 1=Forward, 2=Reverse
-  bool minLimitReached = false;
-  bool maxLimitReached = false;
+  // direction=1 => forward, 2 => reverse
+  bool minReached = false;
+  bool maxReached = false;
 
-  // Full speed
+  // Drive full speed in chosen direction
   controlMotor(motor, direction, 255);
 
-  while (!minLimitReached && !maxLimitReached) {
-    minLimitReached = readLimitSwitch(motor, false); // false => min limit
-    maxLimitReached = readLimitSwitch(motor, true);  // true => max limit
+  // Loop until min or max limit is triggered
+  while (!minReached && !maxReached) {
+    minReached = readLimitSwitch(motor, false);
+    maxReached = readLimitSwitch(motor, true);
     delay(10);
   }
 
+  // Stop once limit triggered
   stopMotor(motor);
 
-  if (minLimitReached) {
-    Serial.printf("Motor %d: MIN limit reached.\n", motor);
+  if (minReached) {
+    Serial.printf("Motor %d: MIN endstop triggered.\n", motor);
   }
-  if (maxLimitReached) {
-    Serial.printf("Motor %d: MAX limit reached.\n", motor);
+  if (maxReached) {
+    Serial.printf("Motor %d: MAX endstop triggered.\n", motor);
   }
 }
 
 // =============================================================================
-// PARSE RS485 DATAGRAM
+// parseRS485Datagram - Convert incoming ASCII string to RS485Datagram
 // =============================================================================
 RS485Datagram parseRS485Datagram(const String &datagram) {
   RS485Datagram parsed;
+  if (datagram.length() < 7) {
+    // Not enough data => return empty
+    return parsed;
+  }
   
-  // Minimal parsing: indexes into string
-  // Real code would confirm lengths, dataLength, etc.
   parsed.startByte   = datagram[0];
   parsed.address     = datagram[1];
   parsed.command     = datagram[2];
@@ -367,97 +454,98 @@ RS485Datagram parseRS485Datagram(const String &datagram) {
   if (parsed.command == CMD_MOTOR) {
     parsed.payload.motorControl.motorID   = datagram[4];
     parsed.payload.motorControl.direction = datagram[5];
-  } 
+  }
   else if (parsed.command == CMD_SOLENOID) {
     parsed.payload.solenoidControl.solenoidID = datagram[4];
     parsed.payload.solenoidControl.state      = datagram[5];
   }
 
-  parsed.checksum  = datagram[datagram.length() - 2];
-  parsed.endByte   = datagram[datagram.length() - 1];
-  
+  parsed.checksum = datagram[datagram.length()-2];
+  parsed.endByte  = datagram[datagram.length()-1];
+
   return parsed;
 }
 
 // =============================================================================
-// HANDLE RS485 COMMAND (READ + DISPATCH)
+// handleRS485Command - Listen on Serial1, parse commands, act
 // =============================================================================
 void handleRS485Command() {
-  // If there's incoming data on Serial1
   if (Serial1.available()) {
+    // For demonstration, read until newline
     String rxData = Serial1.readStringUntil('\n');
-    if (rxData.length() < 6) { 
-      // Not enough length to form a valid datagram
+    if (rxData.length() < 6) {
+      // Not valid
       return;
     }
-
     RS485Datagram datagram = parseRS485Datagram(rxData);
 
+    // Switch on command type
     switch (datagram.command) {
       case CMD_START:
         systemInitialized = true;
-        Serial.println("System Initialized (CMD_START).");
+        Serial.println("System START => motors/solenoids enabled.");
         break;
 
       case CMD_STOP:
         systemInitialized = false;
-        Serial.println("System Stopped (CMD_STOP).");
-        // Optionally stop all motors, turn off solenoids
+        Serial.println("System STOP => shutting down motors/solenoids.");
+        // Stop motors
         stopMotor(0); stopMotor(1); stopMotor(2); stopMotor(3);
+        // Turn off solenoids/air
         controlMOSFET(0, false);
         controlMOSFET(1, false);
         controlMOSFET(2, false);
         controlMOSFET(3, false);
-        controlMOSFET(4, false); // Air compressor
+        controlMOSFET(4, false);
         break;
 
       case CMD_MOTOR: {
+        // Motor command => motorID + direction
         uint8_t mID = datagram.payload.motorControl.motorID;
         uint8_t dir = datagram.payload.motorControl.direction;
-        // Control the motor (full speed)
+        // Example => full speed
         controlMotor(mID, dir, 255);
-        Serial.printf("CMD_MOTOR: Motor %u, direction=%u\n", mID, dir);
+        Serial.printf("CMD_MOTOR => Motor %u, Dir=%u\n", mID, dir);
       } break;
 
       case CMD_SOLENOID: {
-        uint8_t solID = datagram.payload.solenoidControl.solenoidID;
-        bool onOff     = (datagram.payload.solenoidControl.state == 0x01);
+        // Solenoid command => solenoidID + state
+        uint8_t solID   = datagram.payload.solenoidControl.solenoidID;
+        bool onOff      = (datagram.payload.solenoidControl.state == 0x01);
         controlMOSFET(solID, onOff);
-        Serial.printf("CMD_SOLENOID: Solenoid %u => %s\n", solID, onOff?"ON":"OFF");
+        Serial.printf("CMD_SOLENOID => Solenoid %u => %s\n", solID, onOff?"ON":"OFF");
       } break;
 
       default:
-        Serial.println("Unknown RS485 command received.");
+        Serial.println("Unknown RS485 command or invalid data.");
         break;
     }
   }
 }
 
 // =============================================================================
-// SEND RS485 DATAGRAM
+// sendRS485Datagram - Construct & transmit a datagram over RS485
 // =============================================================================
 void sendRS485Datagram(RS485Datagram& datagram) {
-  // Convert datagram into a string or raw bytes as your protocol requires.
-  // Here, we do a simplistic approach as ASCII chars.
-  String data;
-  data += (char)datagram.startByte;
-  data += (char)datagram.address;
-  data += (char)datagram.command;
-  data += (char)datagram.dataLength;
+  // Build ASCII-based or raw byte datagram
+  String out;
+  out += (char)datagram.startByte;
+  out += (char)datagram.address;
+  out += (char)datagram.command;
+  out += (char)datagram.dataLength;
 
   if (datagram.command == CMD_MOTOR) {
-    data += (char)datagram.payload.motorControl.motorID;
-    data += (char)datagram.payload.motorControl.direction;
+    out += (char)datagram.payload.motorControl.motorID;
+    out += (char)datagram.payload.motorControl.direction;
   }
   else if (datagram.command == CMD_SOLENOID) {
-    data += (char)datagram.payload.solenoidControl.solenoidID;
-    data += (char)datagram.payload.solenoidControl.state;
+    out += (char)datagram.payload.solenoidControl.solenoidID;
+    out += (char)datagram.payload.solenoidControl.state;
   }
 
-  data += (char)datagram.checksum;
-  data += (char)datagram.endByte;
+  out += (char)datagram.checksum;
+  out += (char)datagram.endByte;
 
-  // Transmit via Serial1
-  Serial1.print(data);
+  // Transmit
+  Serial1.print(out);
 }
-
